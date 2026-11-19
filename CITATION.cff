@@ -12,7 +12,7 @@ version: 1.0.0
 date-released: 2026-11-18
 identifiers:
 - type: doi
-  value: "10.5281/zenodo.xxxxxxx"
+  value: "10.5281/zenodo.24358888"
   description: "Archived code as of publication."
 preferred-citation:
   type: article
