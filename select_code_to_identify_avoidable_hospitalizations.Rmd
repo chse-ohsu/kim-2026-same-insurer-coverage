@@ -1,0 +1,303 @@
+# Context
+
+This script creates the avoidable hospitalizations outcome by beneficiary-month, using the Prevention Quality Indicators in Inpatient Settings (PQIs) developed by the Agency for Healthcare Research and Quality ([AHRQ](https://qualityindicators.ahrq.gov/)). PQIs identify inpatient hospital admissions for conditions considered potentially preventable with effective outpatient care (e.g. diabetes complications, COPD, hypertension, heart failure). We used the 2025 AHRQ technical specifications to build `pqi_lookup.csv`, a code lookup table included in this repo with the diagnosis and procedure codes needed to flag each individual PQI below.
+
+AHRQ provides guidance for combining individual PQIs into composite measures. We only construct PQI 90 (Prevention Quality Overall Composite), which flags a hospitalization as an avoidable hospitalization if it meets the inclusion/exclusion criteria for any of the 10 individual PQIs that make it up.
+
+This code picks up from the inpatient claim-line table (`ip_claim`) described in `select_code_to_identify_all-cause_hospitalizations.Rmd`, after the HEDIS-based filtering steps in that script but before claims are rolled up to one row per stay, with these additional variables:
+
+- sex
+- age (at the time of the claim)
+- icd_dgns_cd1...icd_dgns_cd25 (up to 25 diagnosis codes)
+- admtg_dgns_cd (admitting diagnosis code)
+- icd_prcdr_cd1...icd_prcdr_cd13 (up to 13 procedure codes)
+- drg_cd
+
+This code also assumes the user has an enrollee-month cohort table called `mbsf` (as described in `select_code_to_identify_same_insurer_status.Rmd`). Note our cohort is restricted to beneficiaries ages 65+, so the AHRQ-specified denominator of ages 18+ is a formality here, but we include it for methodological completeness/transparency.
+
+
+# Load PQI lookup table
+
+```{r}
+pqi_lookup <- fread("pqi_lookup.csv")
+
+# up to 25 dx codes per claim, including the admitting diagnosis
+dx_cols  <- c(paste0("icd_dgns_cd", 1:25), "admtg_dgns_cd")
+
+# up to 13 procedure codes per claim
+pcs_cols <- paste0("icd_prcdr_cd", 1:13)
+```
+
+
+# Apply minimal exclusion criteria
+
+AHRQ specifies excluding discharges with an ungroupable DRG, or missing sex, age, year, or principal diagnosis.
+
+```{r}
+ip_claim <- ip_claim[drg_cd != 999 & !is.na(sex) & !is.na(age) & !is.na(year) & !is.na(icd_dgns_cd1)]
+```
+
+Note: `icd_dgns_cd1` (principal diagnosis) and `admtg_dgns_cd` (admitting diagnosis) often differ on the same claim, so each PQI numerator below checks both fields for the relevant diagnosis code.
+
+
+# PQI 01: Diabetes Short-Term Complications Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for diabetes with short-term complications (ketoacidosis, hyperosmolarity, or coma).
+
+```{r}
+# get codes for this indicator
+diabetes_short_term_icd <- pqi_lookup[code_set == "ACDIASD" & pqi_id == "PQI_01"]$code
+
+# flag numerator
+ip_claim[, pqi_01_num := age >= 18 &
+            (icd_dgns_cd1 %in% diabetes_short_term_icd | admtg_dgns_cd %in% diabetes_short_term_icd)]
+```
+
+
+# PQI 03: Diabetes Long-Term Complications Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for diabetes with long-term complications (renal, eye, neurological, circulatory, other specified, or unspecified).
+
+```{r}
+# get codes for this indicator
+diabetes_long_term_icd <- pqi_lookup[code_set == "ACDIALD" & pqi_id == "PQI_03"]$code
+
+# flag numerator
+ip_claim[, pqi_03_num := age >= 18 &
+            (icd_dgns_cd1 %in% diabetes_long_term_icd | admtg_dgns_cd %in% diabetes_long_term_icd)]
+```
+
+
+# PQI 05: COPD or Asthma in Older Adults Admission Rate
+
+Numerator: hospital discharges, for patients ages 40+, with a principal diagnosis for COPD (excluding acute bronchitis) or asthma.
+Exclusion: any listed diagnosis for cystic fibrosis or an anomaly of the respiratory system.
+
+```{r}
+# get codes for this indicator
+copd_icd <- pqi_lookup[code_set == "ACCOPDD" & pqi_id == "PQI_05"]$code
+asthma_icd <- pqi_lookup[code_set == "ACSASTD" & pqi_id == "PQI_05"]$code
+cf_icd <- pqi_lookup[code_set == "RESPAN" & pqi_id == "PQI_05"]$code
+
+# flag numerator
+ip_claim[, pqi_05_num := age >= 40 &
+            (icd_dgns_cd1 %in% copd_icd | icd_dgns_cd1 %in% asthma_icd |
+               admtg_dgns_cd %in% copd_icd | admtg_dgns_cd %in% asthma_icd)]
+
+# apply exclusion: drop claims with a listed diagnosis anywhere in dx_cols
+ip_claim[pqi_05_num == T, pqi_05_num := !Reduce(`|`, lapply(.SD, `%in%`, cf_icd)), .SDcols = dx_cols]
+```
+
+
+# PQI 07: Hypertension Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for hypertension.
+Exclusions: any listed cardiac procedure code; or a listed chronic kidney disease diagnosis accompanied by a listed dialysis access procedure code.
+
+```{r}
+# get codes for this indicator
+hyp_icd <- pqi_lookup[code_set == "ACSHYPD" & pqi_id == "PQI_07"]$code
+cardiac_pcs <- pqi_lookup[code_set == "ACSCARP" & pqi_id == "PQI_07"]$code
+ckd_icd <- pqi_lookup[code_set == "ACSHY2D" & pqi_id == "PQI_07"]$code
+dialysis_pcs <- pqi_lookup[code_set == "DIALY2P" & pqi_id == "PQI_07"]$code
+
+# flag numerator
+ip_claim[, pqi_07_num := age >= 18 & (icd_dgns_cd1 %in% hyp_icd | admtg_dgns_cd %in% hyp_icd)]
+
+# apply cardiac procedure exclusion
+ip_claim[pqi_07_num == T, pqi_07_num := !Reduce(`|`, lapply(.SD, `%in%`, cardiac_pcs)), .SDcols = pcs_cols]
+
+# apply CKD + dialysis access exclusion
+ip_claim[pqi_07_num == T, has_ckd_dx := Reduce(`|`, lapply(.SD, `%in%`, ckd_icd)), .SDcols = dx_cols]
+ip_claim[pqi_07_num == T, has_dialysis_pcs := Reduce(`|`, lapply(.SD, `%in%`, dialysis_pcs)), .SDcols = pcs_cols]
+ip_claim[pqi_07_num == T, pqi_07_num := !(has_ckd_dx & has_dialysis_pcs)]
+
+# clean up helper columns
+ip_claim[, c("has_ckd_dx", "has_dialysis_pcs") := NULL]
+```
+
+
+# PQI 08: Heart Failure Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for heart failure.
+Exclusion: any listed cardiac procedure code.
+
+```{r}
+# get codes for this indicator
+heart_failure_icd <- pqi_lookup[code_set == "MRTCHFD" & pqi_id == "PQI_08"]$code
+cardiac_pcs <- pqi_lookup[code_set == "ACSCARP" & pqi_id == "PQI_08"]$code
+
+# flag numerator
+ip_claim[, pqi_08_num := age >= 18 & (icd_dgns_cd1 %in% heart_failure_icd | admtg_dgns_cd %in% heart_failure_icd)]
+
+# apply cardiac procedure exclusion
+ip_claim[pqi_08_num == T, pqi_08_num := !Reduce(`|`, lapply(.SD, `%in%`, cardiac_pcs)), .SDcols = pcs_cols]
+```
+
+
+# PQI 11: Community-Acquired Pneumonia Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for community-acquired pneumonia.
+Exclusions: any listed diagnosis for sickle cell/Hemoglobin S disease; or any listed diagnosis or procedure code for an immunocompromised state.
+
+```{r}
+# get codes for this indicator
+pneumonia_icd <- pqi_lookup[code_set == "ACSBACD" & pqi_id == "PQI_11"]$code
+sickle_cell_icd <- pqi_lookup[code_set == "ACSBA2D" & pqi_id == "PQI_11"]$code
+immunoc_icd <- pqi_lookup[code_set == "IMMUNID" & pqi_id == "PQI_11"]$code
+immunoc_pcs <- pqi_lookup[code_set == "IMMUNIP" & pqi_id == "PQI_11"]$code
+
+# flag numerator
+ip_claim[, pqi_11_num := age >= 18 & (icd_dgns_cd1 %in% pneumonia_icd | admtg_dgns_cd %in% pneumonia_icd)]
+
+# apply sickle cell exclusion
+ip_claim[pqi_11_num == T, pqi_11_num := !Reduce(`|`, lapply(.SD, `%in%`, sickle_cell_icd)), .SDcols = dx_cols]
+
+# apply immunocompromised exclusion
+ip_claim[pqi_11_num == T, immunid := Reduce(`|`, lapply(.SD, `%in%`, immunoc_icd)), .SDcols = dx_cols]
+ip_claim[pqi_11_num == T, immunip := Reduce(`|`, lapply(.SD, `%in%`, immunoc_pcs)), .SDcols = pcs_cols]
+ip_claim[pqi_11_num == T, pqi_11_num := !(immunid | immunip)]
+
+# clean up helper columns
+ip_claim[, c("immunid", "immunip") := NULL]
+```
+
+
+# PQI 12: Urinary Tract Infection Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for urinary tract infection.
+Exclusions: any listed diagnosis for a kidney/urinary tract disorder; or any listed diagnosis or procedure code for an immunocompromised state.
+
+```{r}
+# get codes for this indicator
+uti_icd <- pqi_lookup[code_set == "ACSUTID" & pqi_id == "PQI_12"]$code
+kidney_utd_icd <- pqi_lookup[code_set == "KIDNEY" & pqi_id == "PQI_12"]$code
+immunoc_icd <- pqi_lookup[code_set == "IMMUNID" & pqi_id == "PQI_12"]$code
+immunoc_pcs <- pqi_lookup[code_set == "IMMUNIP" & pqi_id == "PQI_12"]$code
+
+# flag numerator
+ip_claim[, pqi_12_num := age >= 18 & (icd_dgns_cd1 %in% uti_icd | admtg_dgns_cd %in% uti_icd)]
+
+# apply kidney/urinary tract disorder exclusion
+ip_claim[pqi_12_num == T, pqi_12_num := !Reduce(`|`, lapply(.SD, `%in%`, kidney_utd_icd)), .SDcols = dx_cols]
+
+# apply immunocompromised exclusion
+ip_claim[pqi_12_num == T, immunid := Reduce(`|`, lapply(.SD, `%in%`, immunoc_icd)), .SDcols = dx_cols]
+ip_claim[pqi_12_num == T, immunip := Reduce(`|`, lapply(.SD, `%in%`, immunoc_pcs)), .SDcols = pcs_cols]
+ip_claim[pqi_12_num == T, pqi_12_num := !(immunid | immunip)]
+
+# clean up helper columns
+ip_claim[, c("immunid", "immunip") := NULL]
+```
+
+
+# PQI 14: Uncontrolled Diabetes Admission Rate
+
+Numerator: hospital discharges, for patients ages 18+, with a principal diagnosis for uncontrolled diabetes without mention of a short-term or long-term complication.
+
+```{r}
+# get codes for this indicator
+diabetes_icd <- pqi_lookup[code_set == "ACDIAUD" & pqi_id == "PQI_14"]$code
+
+# flag numerator
+ip_claim[, pqi_14_num := age >= 18 & (icd_dgns_cd1 %in% diabetes_icd | admtg_dgns_cd %in% diabetes_icd)]
+```
+
+
+# PQI 15: Asthma in Younger Adults Admission Rate
+
+Numerator: hospital discharges, for patients ages 18-39, with a principal diagnosis for asthma.
+Exclusion: any listed diagnosis for cystic fibrosis or an anomaly of the respiratory system.
+
+```{r}
+# get codes for this indicator
+asthma_icd <- pqi_lookup[code_set == "ACSASTD" & pqi_id == "PQI_15"]$code
+cf_icd <- pqi_lookup[code_set == "RESPAN" & pqi_id == "PQI_15"]$code
+
+# flag numerator
+ip_claim[, pqi_15_num := age %between% c(18, 39) & (icd_dgns_cd1 %in% asthma_icd | admtg_dgns_cd %in% asthma_icd)]
+
+# apply exclusion
+ip_claim[pqi_15_num == T, pqi_15_num := !Reduce(`|`, lapply(.SD, `%in%`, cf_icd)), .SDcols = dx_cols]
+```
+
+Note: this PQI is unlikely to contribute any cases in our cohort, which is restricted to ages 65+; we include it for completeness of the PQI 90 composite.
+
+
+# PQI 16: Lower-Extremity Amputation Among Patients with Diabetes Rate
+
+Numerator: hospital discharges, for patients ages 18+, with any listed lower-extremity amputation procedure code and any listed diabetes diagnosis.
+Exclusion: any listed diagnosis for traumatic amputation of the lower extremity.
+
+AHRQ's full specification also excludes claims with a principal diagnosis assigned to Major Diagnostic Category 14 (Pregnancy, Childbirth, and the Puerperium), using a variable only available in TAF claims. We skip that exclusion since amputation claims are rare among pregnant individuals and most amputation claims are in Medicare.
+
+```{r}
+# get codes for this indicator
+lower_amp_pcs <- pqi_lookup[code_set == "ACSLEAP" & pqi_id == "PQI_16"]$code
+diabetes_icd <- pqi_lookup[code_set == "ACSLEAD" & pqi_id == "PQI_16"]$code
+traumatic_amp_icd <- pqi_lookup[code_set == "ACLEA2D" & pqi_id == "PQI_16"]$code
+
+# flag numerator
+ip_claim[, lower_amp := Reduce(`|`, lapply(.SD, `%in%`, lower_amp_pcs)), .SDcols = pcs_cols]
+ip_claim[, diabetes := Reduce(`|`, lapply(.SD, `%in%`, diabetes_icd)), .SDcols = dx_cols]
+ip_claim[, pqi_16_num := age >= 18 & lower_amp & diabetes]
+
+# apply traumatic amputation exclusion
+ip_claim[pqi_16_num == T, pqi_16_num := !Reduce(`|`, lapply(.SD, `%in%`, traumatic_amp_icd)), .SDcols = dx_cols]
+
+# clean up helper columns
+ip_claim[, c("lower_amp", "diabetes") := NULL]
+```
+
+
+# Roll claims up to one row per stay
+
+As in `select_code_to_identify_all-cause_hospitalizations.Rmd`, we don't count transfers as separate admissions, so we group claims for the same beneficiary that overlap or are contiguous into a single stay. A stay is flagged for a given PQI if any of its claims met that PQI's criteria.
+
+```{r}
+pqi_cols <- paste0("pqi_", c("01", "03", "05", "07", "08", "11", "12", "14", "15", "16"), "_num")
+
+# roll each claim to a single row, carrying forward the max of each PQI flag
+ip_visits_pqi <- ip_claim[, c(.(from_dt = min(from_dt), thru_dt = max(thru_dt)),
+                              lapply(.SD, max)), by = .(bene_id, claim_id), .SDcols = pqi_cols]
+
+setorder(ip_visits_pqi, bene_id, from_dt, thru_dt)
+
+# group overlapping/contiguous claims into a stay
+ip_visits_pqi[, stay_id := chse::overlapping(from_dt, thru_dt, maxgap = 0), by = bene_id]
+
+# collapse to one row per stay, carrying forward the max of each PQI flag
+ip_visits_pqi <- ip_visits_pqi[, c(.(from_dt = min(from_dt)), lapply(.SD, max)),
+                               by = .(bene_id, stay_id), .SDcols = pqi_cols]
+```
+
+
+# Create PQI 90 composite
+
+A stay is an avoidable hospitalization if it meets the numerator criteria for any of the 10 individual PQIs above.
+
+```{r}
+ip_visits_pqi[, pqi_90_num := as.integer(Reduce(`|`, .SD)), .SDcols = pqi_cols]
+```
+
+
+# Merge outcome to cohort table
+
+We merge by `from_dt` (admission date) rather than discharge date, so the outcome reflects the month the hospitalization began.
+
+```{r}
+# assign each stay to its month of admission
+ip_visits_pqi[, `:=` (calendar_mo = month(from_dt), year = year(from_dt))]
+
+# a beneficiary can have more than one stay in a month; roll up to one row per beneficiary-month
+ip_visits_pqi <- ip_visits_pqi[, .(pqi_90_num = max(pqi_90_num)), by = .(bene_id, calendar_mo, year)]
+
+mbsf <- merge(mbsf, ip_visits_pqi[, .(bene_id, calendar_mo, year, pqi_90_num)],
+              by = c("bene_id", "calendar_mo", "year"), all.x = T)
+
+# bene-months with no avoidable hospitalization should be 0, not NA
+setnafill(mbsf, fill = 0, cols = "pqi_90_num")
+
+# AHRQ's denominator for this composite is the population ages 18+; our cohort is already 65+
+mbsf[, pqi_denom := as.integer(age >= 18)]
+```

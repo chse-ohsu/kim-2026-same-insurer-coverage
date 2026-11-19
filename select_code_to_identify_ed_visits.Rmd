@@ -1,0 +1,95 @@
+# Context
+
+This script provides select code to identify any emergency department (ED) visit among dual-eligible enrollees in each beneficiary-month observed during the study period.
+
+We identified ED visits using guidance from [ResDAC](https://resdac.org/articles/how-identify-hospital-claims-emergency-room-visits-medicare-claims-data): claims containing emergency room charges are found in the Inpatient and Outpatient claims files, identified by Revenue Center Code (REV_CNTR) values of 0450-0459 (emergency room) or 0981 (professional fees-emergency room). We searched for ED visits that resulted in an inpatient admission in the Medicare Inpatient Encounters and TAF Inpatient files; otherwise, we located ED visits in the Medicare Outpatient Encounters and TAF Other Services files.
+
+This code assumes the user has already combined Medicare encounters (Inpatient and Outpatient) and TAF claims (Inpatient and Other Services files) into a single claim-line table called `claims`, with one row per claim line. The table should include the following variables:  
+
+- bene_id  
+- claim_id  
+- from_dt (claim header begin date)    
+- thru_dt (claim header end date)  
+- line_from_dt (either the line date or revenue center from date)
+- line_thru_dt (either the line date or revenue center thru date) 
+- rev_cntr (revenue center code)  
+
+This code also assumes the user has created an enrollee-month cohort table called `mbsf` (as described in `select_code_to_identify_same_insurer_status.Rmd`), onto which the final ED outcome is merged.
+
+
+
+# Define ED revenue codes
+
+```{r}
+ed_codes <- c("0450", "0451", "0452", "0453", "0454", "0455", "0456", "0457", "0458", "0459", "0981")
+```
+
+
+# Flag and restrict to ED claims
+
+```{r}
+# flag any claim where at least one line carries an ED revenue code
+claims[, ed := fcase(rev_cntr %in% ed_codes, 1, default = 0)] %>%
+  .[, ed := max(ed), by = claim_id]
+
+# keep only ED claims
+claims <- claims[ed == 1]
+```
+
+
+# Fix ED visit dates
+
+Claim header dates (from_dt/thru_dt) don't always reflect when the ED visit occurred. When a revenue line date is available, we replace the header date with it.
+
+```{r}
+# pull the ED revenue line dates onto all lines of the claim
+claims[rev_cntr %in% ed_codes, `:=` (new_from_dt = rev_cntr_from_dt,
+                                     new_thru_dt = rev_cntr_thru_dt)]
+claims[, `:=` (new_from_dt = min(new_from_dt, na.rm = T),
+               new_thru_dt = max(new_thru_dt, na.rm = T)), by = claim_id]
+
+# replace header dates with revenue line dates when available
+claims[, `:=` (from_dt = ifelse(!is.na(new_from_dt), new_from_dt, from_dt),
+               thru_dt = ifelse(!is.na(new_thru_dt), new_thru_dt, thru_dt))]
+```
+
+
+# Roll claims up to one row per encounter
+
+```{r}
+ed_claims <- claims[, .(from_dt = min(from_dt), thru_dt = max(thru_dt)), by = .(bene_id, claim_id)]
+```
+
+
+# Collapse overlapping/contiguous claims into a single visit
+
+A single ED visit can generate more than one claim (e.g. a facility claim and a professional claim, or a Medicare claim and a TAF claim for the same visit). We group claims for the same beneficiary that overlap or are contiguous and treat them as one visit.
+
+```{r}
+setorder(ed_claims, bene_id, from_dt)
+
+# group overlapping/contiguous claims into a visit id
+ed_claims[, visit_id := chse::overlapping(from_dt, thru_dt, maxgap = 0), by = bene_id]
+
+# collapse each group into a single visit
+ed_visits <- ed_claims[, .(ed_start = min(from_dt), ed_end = max(thru_dt)), by = .(bene_id, visit_id)]
+```
+
+
+# Create "any ED visit" flag by month
+
+```{r}
+ed_visits[, `:=` (calendar_mo = month(ed_start), year = year(ed_start))]
+
+final <- unique(ed_visits[, .(bene_id, year, calendar_mo, ed = 1)])
+```
+
+
+# Merge outcome to cohort table
+
+```{r}
+mbsf <- merge(mbsf, final, by = c("bene_id", "year", "calendar_mo"), all.x = T)
+
+# bene-months with no ED visit should be 0, not NA
+setnafill(mbsf, fill = 0, cols = "ed")
+```

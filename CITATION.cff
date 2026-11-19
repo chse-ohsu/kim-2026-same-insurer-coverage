@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated paper."
+title: "Code for: Same-Insurer Coverage Associated With Fewer Hospitalizations, More Outpatient Visits Among Dual-Eligible Enrollees"
+authors:
+  - family-names: "Senders"
+    given-names: "Angela"
+  - family-names: "Cheekati"
+    given-names: "Maanya"
+  - family-names: "Edelstein"
+    given-names: "Sara"
+version: 1.0.0
+date-released: 2026-11-18
+identifiers:
+- type: doi
+  value: "10.5281/zenodo.xxxxxxx"
+  description: "Archived code as of publication."
+preferred-citation:
+  type: article
+  title: "Same-Insurer Coverage Associated With Fewer Hospitalizations, More Outpatient Visits Among Dual-Eligible Enrollees"
+  authors:
+    - family-names: "Kim"
+      given-names: "H"
+    - family-names: "Senders"
+      given-names: "A"
+    - family-names: "Cheekati"
+      given-names: "M"
+    - family-names: "Edelstein"
+      given-names: "S"
+    - family-names: "Lindner"
+      given-names: "SR"
+    - family-names: "Retchin"
+      given-names: "SM"
+    - family-names: "Jung"
+      given-names: "J"
+  journal: "Health Affairs"
+  year: 2026
+  doi: "10.1377/hlthaff.2025.01411"

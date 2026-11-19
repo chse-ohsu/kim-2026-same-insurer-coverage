@@ -1,0 +1,218 @@
+# Context
+
+This script creates hospitalization-related outcomes by beneficiary-month: any inpatient admission, hospital days, 30-day readmission, and discharge to home (vs. post-acute care).
+
+We used 2020 [HEDIS specifications](https://www.ncqa.org/hedis/measures/acute-hospital-utilization/) (Inpatient Utilization-General Hospital/Acute Care) to identify acute inpatient hospitalizations in Medicare Inpatient Encounters and TAF Inpatient files. HEDIS value sets are licensed by NCQA and are not reproduced here; researchers can obtain them directly from NCQA. We measured hospitalizations between January 1, 2018 and November 30, 2021, allowing a 30-day window after the last month of hospitalizations to assess readmissions before the end of the study period.
+
+This code assumes the user has already combined Medicare and TAF inpatient claims into a single claim-line table called `ip_claim`, with one row per claim line. The table should include the following variables:
+
+- bene_id
+- claim_id
+- from_dt / thru_dt (claim header begin/end dates)
+- stus_cd (UB-04 patient discharge status code)
+- rev_cntr (revenue center code)
+- tob (type of bill)
+- icd_dgns_cd1 (principal ICD-10-CM diagnosis code)
+
+This code also assumes the user has an enrollee-month cohort table called `mbsf` (as described in `select_code_to_identify_same_insurer_status.Rmd`) and a reference table called `month_years`, with one row per calendar month in the study period giving that month's start date (`month_start`), end date (`month_end`), and number of days (`days_in_mo`).
+
+
+# Identify acute inpatient stays
+
+HEDIS identifies an inpatient stay using revenue center code and type-of-bill value sets, and further excludes stays for deliveries and mental/behavioral health conditions using ICD-10-CM diagnosis value sets. These value sets are licensed by NCQA; this code assumes the user has obtained them and defined each as a vector of codes (`hedis_ip_stay_rev`, `hedis_non_acute_rev`, `hedis_non_acute_tob`, `hedis_deliveries_icd`, `hedis_mental_icd`).
+
+```{r}
+# flag claim lines on an inpatient stay
+ip_claim[, hosp := 1*(rev_cntr %in% hedis_ip_stay_rev)]
+ip_claim <- ip_claim[hosp == 1]
+
+# a stay with both acute and non-acute lines still counts as an acute stay, so we only remove
+# the non-acute lines rather than dropping the whole claim
+ip_claim <- ip_claim[!(rev_cntr %in% hedis_non_acute_rev | tob %in% hedis_non_acute_tob)]
+
+# exclude claims for deliveries or mental/behavioral health
+ip_claim <- ip_claim[!(icd_dgns_cd1 %in% hedis_deliveries_icd)]
+ip_claim <- ip_claim[!(icd_dgns_cd1 %in% hedis_mental_icd)]
+```
+
+
+# Roll claims up to one row per stay
+
+Admissions are often billed as multiple claims (e.g. interim bills, or a transfer between facilities). We don't count transfers as separate admissions, so we group claims for the same beneficiary that overlap or are contiguous (discharge and next admission on the same or adjacent day) into a single stay, keeping the discharge status code from the last claim in the stay.
+
+```{r}
+# roll each claim to a single row
+ip_visits <- ip_claim[, .(from_dt = min(from_dt), thru_dt = max(thru_dt), stus_cd = max(stus_cd)),
+                      by = .(bene_id, claim_id)]
+
+setorder(ip_visits, bene_id, from_dt, thru_dt)
+
+# group overlapping/contiguous claims into a stay
+ip_visits[, stay_id := chse::overlapping(from_dt, thru_dt, maxgap = 0), by = bene_id]
+
+# keep the discharge status from the latest claim in the stay (excluding unknown code "00")
+ip_visits[, max_thru_dt := max(thru_dt), by = .(bene_id, stay_id)]
+ip_visits[thru_dt == max_thru_dt & stus_cd != "00", new_stus_cd := stus_cd]
+
+# roll up to one row per stay
+ip_visits <- ip_visits[, .(from_dt = min(from_dt), thru_dt = max(thru_dt), stus_cd = max(new_stus_cd, na.rm = T)),
+                       by = .(bene_id, stay_id)]
+
+# add back the unknown code if stus_cd is missing after rolling up
+ip_visits[is.na(stus_cd), stus_cd := "00"]
+```
+
+
+# Hospital admission
+
+We assign a stay to a month using the admission date rather than the discharge date. This lets us confirm the beneficiary was enrolled throughout a long stay, but means a stay isn't counted until the month it began.
+
+```{r}
+# assign each stay to the month of admission and calculate its length of stay
+admissions_los <- ip_visits[, .(bene_id, calendar_mo = month(from_dt), year = year(from_dt),
+                                los = as.numeric(difftime(thru_dt, from_dt, units = "days") + 1))]
+
+# any admission in the month
+admissions <- unique(admissions_los[, .(bene_id, year, calendar_mo, hosp = 1)])
+```
+
+
+# Length of stay
+
+Numerator: sum of length of stay for stays starting in the month. Denominator: count of admissions starting in the month.
+
+```{r}
+# sum LOS and count admissions by beneficiary-month
+length_of_stay <- admissions_los[, .(los = sum(los), los_den = .N), by = .(bene_id, year, calendar_mo)]
+```
+
+
+# Readmission within 30 days
+
+We first identify "index" discharges, then check whether each was followed by another admission within 30 days. A readmission is reported in the month that falls 30 days after the index discharge.
+
+## Identify index discharges
+
+Index discharges exclude one-day stays and stays ending in death (discharge status codes 20, 40-42). Because a beneficiary can have several admissions close together, we also group discharges that are less than 31 days apart and keep only the first discharge in each group, so each index discharge gets a full, non-overlapping 30-day follow-up window.
+
+```{r}
+# exclude one-day stays and discharges that ended in death
+index <- ip_visits[!stus_cd %in% c("20", "40", "41", "42") & from_dt != thru_dt,
+                   .(bene_id, from_dt, thru_dt)]
+
+# order discharges within beneficiary so we can group them in sequence
+setorder(index, bene_id, from_dt, thru_dt)
+
+# get the most discharges any one beneficiary has, to set how many times the loop below needs to run
+maxvisits <- index[, .N, by = bene_id][, max(N)]
+
+# start everyone in group 1, anchored to their first discharge date
+index[, group := 1]
+index[, group_date := .SD[1], .SDcols = "thru_dt", by = bene_id]
+
+# start a new group whenever the next admission is 31+ days after the current group's discharge date,
+# then update the group's discharge date to the first discharge in that new group
+for (i in 2:maxvisits) {
+  index[from_dt >= group_date + days(31), group := i]
+  index[, group_date := .SD[1], .SDcols = "thru_dt", by = .(bene_id, group)]
+}
+
+# keep only the first discharge in each window
+index <- index[thru_dt == group_date, .(bene_id, from_dt, thru_dt)]
+```
+
+
+## Check continuous enrollment
+
+A beneficiary must be enrolled in the cohort in the month of discharge and in the month 30 days post-discharge (and not have died in between) for us to fully observe a readmission.
+
+```{r}
+# add month/year of discharge
+index[, `:=` (calendar_mo = month(thru_dt), year = year(thru_dt))]
+
+# flag enrollment in the month of discharge
+index <- merge(index, mbsf[, .(bene_id, year, calendar_mo, enrolled_dis = 1, death_dt_dis = death_dt)],
+              by = c("bene_id", "year", "calendar_mo"), all.x = T)
+
+# restrict to discharges where the beneficiary was enrolled at discharge
+index <- index[enrolled_dis == 1]
+
+# identify the month that is 30 days after discharge
+index[, thru_dt_plus30 := thru_dt + 30]
+index[, `:=` (calendar_mo = month(thru_dt_plus30), year = year(thru_dt_plus30))]
+
+# flag enrollment in the month 30 days post-discharge
+index <- merge(index, mbsf[, .(bene_id, year, calendar_mo, enrolled = 1, death_dt)],
+              by = c("bene_id", "year", "calendar_mo"), all.x = T)
+
+# restrict to discharges where the beneficiary was still enrolled 30 days later
+index <- index[enrolled == 1]
+
+# flag discharges where the beneficiary died before the 30-day window ended
+index[, died := (!is.na(death_dt) & death_dt <= thru_dt_plus30) | (!is.na(death_dt_dis) & death_dt_dis <= thru_dt_plus30)]
+
+# drop discharges where the beneficiary died within 30 days
+index <- index[died == F]
+```
+
+
+## Flag readmissions
+
+An index discharge is a readmission if any inpatient stay began within the following 30 days. An index discharge can itself be a readmission of an earlier index discharge.
+
+```{r}
+# get every stay's admission date, duplicated into two columns so foverlaps can test it as a single-day interval
+readmit <- ip_visits[, .(bene_id, readmit_dt = from_dt, readmit_dt_copy = from_dt)]
+
+# match index discharges to any admission that falls within their 30-day follow-up window
+setkey(index, bene_id, thru_dt, thru_dt_plus30)
+setkey(readmit, bene_id, readmit_dt, readmit_dt_copy)
+readmit <- foverlaps(index, readmit)
+
+# flag a readmission if a matching admission was found
+readmit[, readmission := 1*(!is.na(readmit_dt))]
+
+# make unique per beneficiary-month (an index discharge month can have more than one admission match)
+readmit <- readmit[, .(readmission = max(readmission)), by = .(bene_id, calendar_mo, year)]
+readmit[, readmission_den := 1]
+```
+
+
+# Discharge home
+
+We limit to stays with an eligible discharge disposition (home/self-care, skilled nursing facility, intermediate care facility, home health care, swing bed, inpatient rehabilitation, or long-term care hospital), and flag discharge to home (vs. the other post-acute care settings in that list).
+
+```{r}
+# limit to stays with an eligible discharge disposition
+dis_home <- ip_visits[stus_cd %in% c("01", "03", "04", "06", "61", "62", "63")]
+
+# flag discharge home (vs. the other eligible post-acute settings) and add month/year of discharge
+dis_home[, `:=` (discharge_home = 1*(stus_cd %in% c("01", "06")),
+                 calendar_mo = month(thru_dt), year = year(thru_dt))]
+
+# make unique per beneficiary-month
+dis_home <- dis_home[, .(discharge_home = max(discharge_home)), by = .(bene_id, calendar_mo, year)]
+
+# add denominator flag
+dis_home[, discharge_home_den := 1]
+```
+
+
+# Combine outcomes and merge to cohort table
+
+```{r}
+# merge hospital outcomes
+final <- Reduce(function(...) merge(..., by = c("bene_id", "year", "calendar_mo"), all = TRUE),
+                list(admissions, length_of_stay, dis_home))
+final <- merge(final, readmit, by = c("bene_id", "year", "calendar_mo"), all = T)
+
+# merge hospital outcomes to mbsf table
+mbsf <- merge(mbsf, final, by = c("bene_id", "year", "calendar_mo"), all.x = T)
+
+# denominator flags are 0 (not NA) for bene-months not at risk for that outcome
+setnafill(mbsf, fill = 0, cols = c("readmission_den", "discharge_home_den", "los_den"))
+
+# admission is 0 (not NA) for bene-months with no stay
+mbsf[, c("hosp") := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = c("hosp")]
+```
+

@@ -1,0 +1,94 @@
+# Context
+
+This script runs the staggered difference-in-differences regression used to estimate the association between same-insurer coverage and health care use. We used the approach developed by Sun and Abraham: Sun L, Abraham S. Estimating dynamic treatment effects in event studies with heterogeneous treatment effects. *J Econom*. 2021;225(2):175-199.
+
+The unit of analysis is the enrollee x six-month calendar period. Enrollees who transition into same-insurer coverage (as defined in `select_code_to_identify_same_insurer_status.Rmd`) during the study period make up the treatment group, assigned to a "wave" based on the six-month period in which they transition; enrollees who never transition make up the comparison group. This script assumes that assignment has already been made and that the user has an analytic file called `cohort`, with one row per enrollee-period, including:
+
+- bene_id
+- study_groupf (treatment wave: 0 for the comparison group, 1-k for the six-month calendar period in which the enrollee transitions to same-insurer coverage)
+- periodf (the calendar six-month period, as a factor)
+- timef (each period labeled "pre"/"post" the switch, e.g. `pre3`, `post0`; `timef` further collapses the two reference periods, `pre1` and the comparison sentinel, into one `reftime` level -- the omitted reference category in the model formula below)
+- group/period indicator columns: a 0/1 column for every treatment group (e.g. `g5`), every calendar period (e.g. `pre3`), and every group-by-period cell that appears in the data (e.g. `g5_pre3`, equal to 1 for enrollees in treatment wave 5 observed at relative period `pre3`) -- the aggregation function below uses these to count how many enrollee-periods fall into each cell being aggregated
+- n_mo_period (number of months the enrollee was observed within the period; used as a regression weight)
+- state_res, year, state_cnty_fips_cd (state, year, and county identifiers, used for state-by-year fixed effects and county-clustered standard errors)
+- ltss_user_type (type of Medicaid LTSS received during the period: home and community-based services, nursing facility, or both)
+- 24 time-varying chronic condition indicators from the CMS Chronic Condition Warehouse algorithms
+- Kim et al. claims-based frailty_index score
+- the outcome variable for the model being run (e.g. `ed`, `hosp`, `op_visits`, `pqi_90_num`, `los`, `readmission`, `discharge_home` -- as built in the `select_code_to_identify_*.Rmd` scripts, aggregated to the enrollee-period level)
+
+
+## Model specification
+
+The model is specified as:
+
+Y_it = a_i + l_t + d_(s(i),y(t)) + sum_g sum_(l != -1) b_(g,l) * 1[G_i = g] * 1[t - G_i = l] + X_it'g + e_it
+
+where Y_it is the outcome for enrollee i in six-month period t; a_i are enrollee fixed effects; l_t are calendar-period fixed effects; d_(s(i),y(t)) are state-by-year fixed effects; G_i is enrollee i's treatment wave (0 for comparison enrollees); and X_it is a vector of the time-varying covariates listed above. The interaction terms 1[G_i=g] x 1[t-G_i=l] estimate the treatment effect b_(g,l) at each relative period l for each treatment wave g, relative to the period immediately preceding the switch (l = -1), which serves as the reference period. Standard errors are clustered at the county level, and observations are weighted by the number of months the enrollee was observed in the period (`n_mo_period`).
+
+Below, set `outcome` to the name of the outcome variable you want to model (e.g. `outcome <- "ed"`).
+
+
+# Subset for secondary outcomes
+
+Length of stay, readmission, and discharge home are only defined for enrollee-periods at risk for that outcome (i.e. those with a qualifying hospitalization), using the denominator flags built in `select_code_to_identify_all-cause_hospitalizations.Rmd`.
+
+```{r}
+if (outcome == "los")            cohort <- cohort[los_den >= 1]
+if (outcome == "readmission")    cohort <- cohort[readmission_den >= 1]
+if (outcome == "discharge_home") cohort <- cohort[discharge_home_den >= 1]
+```
+
+
+# Model call
+
+```{r}
+f <- as.formula(paste0(
+  outcome,
+  " ~ study_groupf + i(timef, study_groupf, ref = 'reftime') + ltss_user_type + ",
+  "adrd + ami + anemia + asthma + atrial_fib + bph + any_cancer + cataract + chronickidney + copd + ",
+  "depression + diabetes + glaucoma + hf + hip + hlp + hypertension + hypothyroid + ischemic + ",
+  "osteoporosis + parkinson + pneumonia + arthritis + stroke + frailty_index | bene_id + periodf + state_res^year"
+))
+
+model <- fixest::feols(f, data = cohort, weights = ~n_mo_period, cluster = ~state_cnty_fips_cd)
+
+summary(model)
+```
+
+## Get variance-covariance matrix
+
+```{r}
+vcov_matrix <- as.matrix(vcov(model))
+```
+
+
+# Aggregate Sun and Abraham estimates
+
+Each group-by-period coefficient (e.g. `g5_pre3`) is a treatment effect estimate for one treatment wave at one relative time period. To get an overall effect across waves for a period of interest (or across waves and periods, e.g. all post-treatment periods combined), we average the relevant coefficients, weighting by each wave's share of enrollee-periods, and obtain the standard error of that weighted average via the delta method.
+
+This function can be used to build any aggregate estimate of interest by passing it the names of the coefficients (`vars_to_avg`) to average together. See Sun and Abraham (2021) for additional detail on constructing these aggregates.
+
+```{r}
+agg_coefficients <- function(model, vars_to_avg, data, vcov_matrix) {
+
+  # each wave's share of enrollee-periods among the coefficients being averaged
+  Ns <- sapply(vars_to_avg, function(x) nrow(data[get(x) == 1, ]))
+  pct_of_pop <- Ns / sum(Ns)
+
+  # weighted average of the coefficient estimates
+  estimates <- sapply(vars_to_avg, function(x) model$coefficients[names(model$coefficients) == x])
+  estimate <- sum(pct_of_pop * estimates)
+
+  # standard error of the weighted average, via the delta method
+  var_matrix <- vcov_matrix[vars_to_avg, vars_to_avg]
+  weights <- as.matrix(pct_of_pop)
+  se <- as.vector(sqrt(t(weights) %*% var_matrix %*% weights))
+
+  # two-sided t-test
+  df <- df.residual(model)
+  p <- 2 * pt(abs(estimate / se), df, lower = FALSE)
+
+  data.table(Estimate = round(estimate, 4), SE = round(se, 4),
+            LB = round(estimate - 1.96 * se, 4), UB = round(estimate + 1.96 * se, 4), P = round(p, 4))
+}
+```

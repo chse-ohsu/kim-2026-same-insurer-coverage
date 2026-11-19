@@ -1,0 +1,108 @@
+# Context
+
+This script counts outpatient visits per beneficiary-month. We modified the approach taken by [Tang et al. 2025, Health Affairs](https://www.healthaffairs.org/doi/10.1377/hlthaff.2025.00683), who used CMS' [Restructured BETOS Classification System (RBCS)](https://data.cms.gov/provider-summary-by-type-of-service/provider-service-classifications/restructured-betos-classification-system) to identify outpatient office visits by HCPCS code. We identified a visit using any HCPCS code in the RBCS "Office/Outpatient Services" subcategory (under the "E&M" category), plus four e-visit codes not yet captured in that subcategory (99423, G2061, G2062, G2063). We also included the RBCS "Behavioral Health Services" subcategory, which Tang et al. did not. We excluded claims with a place of service code indicating an overnight stay, an ED visit, or an inpatient stay.
+
+This code assumes the user has already combined Medicare Carrier claims and TAF Other Services claims into a single claim-line table called `claims`, with one row per claim line. The table should include the following variables:
+
+- bene_id
+- claim_id
+- from_dt / thru_dt (claim header begin/end dates)
+- line_from_dt / line_thru_dt (claim line begin/end dates)
+- hcpcs_cd (procedure code)
+- clm_plcsrvc (place of service from the claim header)
+- line_plcsrvc (place of service from the claim line, when available separately from the header; TAF claims only carry one place-of-service field, so for those rows this will equal the header value)
+
+This code also assumes the user has downloaded the RBCS taxonomy file (`RBCS_Taxonomy_RY2025.csv`) from [CMS](https://data.cms.gov/provider-summary-by-type-of-service/provider-service-classifications/restructured-betos-classification-system), and has created an enrollee-month cohort table called `mbsf` (as described in `select_code_to_identify_same_insurer_status.Rmd`).
+
+
+# Get BETOS lookup
+
+```{r}
+betos <- fread("RBCS_Taxonomy_RY2025.csv")
+
+# limit to the E&M category
+betos <- betos[RBCS_Cat_Desc == "E&M"]
+
+# limit to office/outpatient and behavioral health subcategories
+betos <- betos[RBCS_Subcat_Desc %in% c("Behavioral Health Services", "Office/Outpatient Services")]
+
+# a code can appear under more than one subcategory; keep one row per code, prioritizing Office/Outpatient
+setorder(betos, HCPCS_Cd, -RBCS_Subcat_Desc)
+betos <- betos[, .SD[1], by = HCPCS_Cd]
+```
+
+
+# Flag and limit to outpatient claims
+
+```{r}
+# flag office/outpatient codes (including the added e-visit codes) and behavioral health codes
+claims[, `:=` (op_oos = hcpcs_cd %in% betos[RBCS_Subcat_Desc == "Office/Outpatient Services", HCPCS_Cd] |
+                        hcpcs_cd %in% c("99423", "G2061", "G2062", "G2063"),
+               op_bh = hcpcs_cd %in% betos[RBCS_Subcat_Desc == "Behavioral Health Services", HCPCS_Cd])]
+
+# keep only claims with one of these codes
+claims <- claims[op_oos == T | op_bh == T]
+```
+
+
+# Exclude by place of service
+
+The claim header and claim line place-of-service fields occasionally disagree. We conservatively exclude a claim if either field indicates an overnight stay, an ED visit, or an inpatient stay.
+
+```{r}
+pos_exclude <- c("13", "14", "16", "21", "23", "31", "32", "33", "34", "51", "55", "56", "61")
+
+# flag claims to exclude
+claims[, excluded_pos := clm_plcsrvc %in% pos_exclude | line_plcsrvc %in% pos_exclude]
+
+# drop excluded claims
+claims <- claims[excluded_pos == F]
+```
+
+
+# Set visit date
+
+Header dates (from_dt/thru_dt) often span more days than the actual visit, so we prefer the claim line dates. But sometimes the line dates span multiple days too; in that case, whichever line-date field stays the same across all lines on a claim is likely an anchor date rather than the true service date, so we use the field that varies instead.
+
+```{r}
+# fill in missing line dates with header dates
+claims[is.na(line_from_dt), line_from_dt := from_dt]
+claims[is.na(line_thru_dt), line_thru_dt := thru_dt]
+
+# fix any lines where the line from date is after the line thru date
+claims[line_from_dt > line_thru_dt, line_from_dt := line_thru_dt]
+
+# flag one-day claims and claims with more than one from/thru date across lines
+claims[, one_day_line := line_from_dt == line_thru_dt]
+claims[, `:=` (multi_from = uniqueN(line_from_dt) > 1,
+               multi_thru = uniqueN(line_thru_dt) > 1), by = .(bene_id, claim_id)]
+
+# default to the line thru date; when only the from date varies across lines, use that instead
+claims[, visit_dt := line_thru_dt]
+claims[one_day_line == F & multi_thru == F & multi_from == T, visit_dt := line_from_dt]
+
+# make unique by visit date
+claims <- unique(claims[, .(bene_id, visit_dt)])
+```
+
+
+# Limit to bene-months and sum visits by month
+
+```{r}
+# restrict to visits in a month the beneficiary was observed in the cohort
+claims[, bene_mo := paste(bene_id, month(visit_dt), year(visit_dt), sep = "_")]
+claims <- merge(claims, mbsf[, .(bene_mo)], by = "bene_mo", all = F)
+
+# count visits per beneficiary-month
+op_visits <- claims[, .(op_visits = .N), by = bene_mo]
+```
+
+
+# Merge outcome to cohort table
+
+```{r}
+mbsf <- merge(mbsf, op_visits, by = "bene_mo", all.x = T)
+
+# bene-months with no outpatient visits should be 0, not NA
+setnafill(mbsf, fill = 0, cols = "op_visits")
+```

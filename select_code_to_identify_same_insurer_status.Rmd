@@ -1,0 +1,403 @@
+# Context
+
+This script provides select code to identify dual eligible enrollees with same-insurer status. The code assumes the user has created a table called "mbsf" with one row per beneficiary-month-Medicaid plan. An individual with one Medicaid plan will have one row per month observed, an individual with two Medicaid plans (e.g. an MCO plan and a stand alone MLTSS plan) will have two rows for each month observed, one row where the Medicaid plan is the MCO and a second row where the Medicaid plan is the MLTSS plan. The table should include the following variables:  
+
+- bene_id  
+- death date  
+- state  
+- year  
+- month  
+- MA contract id  
+- MA plan id  
+- MA parent organization (from the Plan Characteristics File Base segment)  
+- TAF managed care plan id  
+- TAF parent organization (from the CHSE Managed Care Crosswalk)  
+
+This script provides code to load and clean Medicare and Medicaid parent organization names in order to flag names that match (i.e. same_insurer_status == 1). Once matches have been identified, users can merge the same_insurer_flag to their mbsf table by medicare parent organization, medicaid parent organization, state, and year. Finally, we provide code to categorize same-insurer status so that the mbsf table can be aggregated to beneficiary-month level. 
+
+
+# Required Packages 
+
+```{r}
+library(data.table)
+library(magrittr) 
+library(dplyr)
+library(stringr)
+library(readxl)
+```
+
+
+# Identify MA parent orgs
+
+This chunk of code loads Medicare parent organizations from the Plan Characteristics File Base segment, merges them to their service state from the Plan Characteristics Service Area segment, and cleans some parent org names to facilitate matching to Medicaid parent org names in subsequent steps.  
+
+
+## Set years
+
+```{r}
+years <- c(2018, 2019, 2020, 2021)  
+```
+
+
+## Load Plan Characteristic File 
+
+```{r}
+# create empty table to bind to
+plan_char <- data.table()
+
+# load plan characteristics file for each year
+for (year in years) {
+  
+  # load table
+  temp <- as.data.table(readRDS(file.path(plan_char_path, paste0("plan_char_", year, ".RDS")))) 
+  
+  # add year
+  temp[, year:= year]
+  
+  # bind
+  plan_char <- rbind(plan_char, temp)
+  
+}
+```
+
+
+## Load Service Area File
+
+```{r}
+# create empty table to bind to
+service_area <- data.table()
+
+# load plan characteristics file for each year
+for (year in years) {
+  
+  temp <- as.data.table(readRDS(file.path(plan_char_path, paste0("service_area_", year, ".RDS"))))
+  temp[, year:= year]
+  
+  # bind
+  service_area <- rbind(service_area, temp, fill = T)
+  
+  rm(temp)
+}
+```
+
+
+## Create unique list of MA parent orgs
+
+```{r}
+# merge service area to MA parent orgs
+medicare_orgs <- distinct(left_join(plan_char[,c("contract_id", "plan_id", "year","parent_organization")], 
+                                    service_area[,c("contract_id", "plan_id", "year", "state_name")], 
+                                    by = c("contract_id", "plan_id", "year")))
+
+# merge state abbreviations
+state_lookup <- rbind(data.table(state_name = state.name, state_cd = state.abb), 
+                      data.table(state_name = "Washington D.C.", state_cd = "DC" ))
+medicare_orgs <- merge(medicare_orgs, state_lookup, by = "state_name")
+
+# clean MA parent org names 
+  # names that apply across all states
+    medicare_orgs[, hardcode_parent_org := 
+      fifelse(parent_organization == "ALLINA HEALTH AND AETNA INSURANCE COMPANY", 
+              "Allina Health and Aetna Insurance Holding Company",
+      fifelse(parent_organization == "Anthem Insurance Co. & BCBSMA & BCBSRI & BCBSVT", "Anthem Inc.",
+      fifelse(parent_organization %in% c("Blue Cross Blue Shield of Michigan Mutual Ins. Co.", 
+                                        "Blue Cross Blue Shield of Michigan Mutual Insuranc"), 
+              "Blue Cross Blue Shield of Michigan",
+      fifelse(parent_organization == "Moda Partners, Inc.", "Moda, Inc.",
+      fifelse(parent_organization == "Tufts Associated HMO, Inc.", "Tufts Health Plan, Inc",
+      fifelse(parent_organization == "Bright Health Management", "Bright Health, Inc.",
+      fifelse(parent_organization == "SCAN Health Plan", "SCAN Group",
+      fifelse(parent_organization == "Health First, Inc.", "Healthfirst, Inc.",
+      fifelse(parent_organization == "PacificSource Health Plans", "PacificSource",
+      fifelse(parent_organization == "The Johns Hopkins Health System Corporation", 
+              "Johns Hopkins Healthcare LLC",
+      fifelse(parent_organization == "Utd Methodist Retirement Communities of SE MI", 
+      "United Methodist Retirement Communities, Inc.",
+      fifelse(parent_organization %in% c("Itasca County", "Itasca County Health & Human Services"), 
+              "Itasca Medical Care",
+      fifelse(parent_organization == "The Moses H. Cone Memorial Hospital Operating Corp", 
+              "Moses H. Cone Memorial Hospital Corp.",        
+      fifelse(parent_organization == "Catholic Health System, Inc.", "Catholic Health Care System",
+      fifelse(parent_organization == "CareSource Management Group Co.", "CareSource",
+      fifelse(parent_organization == "Gateway Health Plan, LP", "Gateway Health, LLC.",
+      fifelse(parent_organization == "Health Plan Holdings, Inc.", "Tufts Health Plan",
+      fifelse(parent_organization == "UnitedHealth Group, Inc.", "United Healthcare",
+      fifelse(parent_organization == "Kaiser Foundation Health Plan, Inc.", "Kaiser Permanente",
+      fifelse(parent_organization == "UAB Health System", "University of Alabama at Birmingham Health System",
+      fifelse(parent_organization == "Sutter Valley Hospitals", "Sutter Health",
+      fifelse(parent_organization == "PrimeWest Rural MN Health Care Access Initiative", 
+              "PrimeWest Health",
+      fifelse(parent_organization %in% c("Fallon Community Health Plan", "Fallon Community Health Plan, Inc."), 
+              "Fallon Health Plan",
+      fifelse(parent_organization == "Ascension Health Alliance", "Ascension Health",
+      fifelse(parent_organization == "CHRISTUS Health Plan", "CHRISTUS Health",
+      fifelse(parent_organization == "California Physicians' Service", "Blue Shield of California",
+      fifelse(parent_organization == "Total Community Options, Inc.", "InnovAge",
+      fifelse(parent_organization == "WellCare Health Plans, Inc.", "WellCare",
+      fifelse(parent_organization == "University of Utah", "University of Utah Health Plans",
+                           parent_organization)))))))))))))))))))))))))))))]
+  
+  # names that are unique to certain states
+    medicare_orgs[, hardcode_parent_org := 
+                   fifelse(parent_organization == "BCBS MN, MT, NE, ND, WY, Wellmark IA and SD" & state_cd == "ND", 
+                           "Blue Cross Blue Shield of North Dakota",
+                   fifelse(parent_organization == "BCBS MN, MT, NE, ND, WY, Wellmark IA and SD" & state_cd == "WY", 
+                           "Blue Cross Blue Shield of Wyoming",
+                   fifelse(parent_organization == "Centro de Salud de la Comunidad de San Ysidro" & state_cd == "CA", 
+                           "San Ysidro Health",
+                   fifelse(parent_organization == "Los Angeles Jewish Home for the Aging" & state_cd == "CA", 
+                           "Los Angeles Jewish Health",
+                   fifelse(parent_organization == "A&D Charitable Foundation, Inc." & state_cd == "MI", 
+                           "A & D Home Health Care, Inc.", 
+                   fifelse(parent_organization == "Valire PACE Foundation" & state_cd == "OK", 
+                           "Valir Health",
+                   fifelse(parent_organization == "Albright Care Services" & state_cd == "PA", 
+                           "Albright LIFE",
+                   fifelse(parent_organization %in% c("SpiritTrust Lutheran", "The Lutheran Home for The Aged") & 
+                             state_cd == "PA", 
+                           "Lutheran SeniorLife",
+                   fifelse(parent_organization == "NEIGHBORHOOD HEALTH PLAN OF RHODE ISLAND" & state_cd == "RI", 
+                           "Neighborhood Health Plan of RI",
+                   fifelse(parent_organization == "Bienvivir Senior Health Services" & state_cd == "TX", 
+                           "Bienvivir",
+                   fifelse(parent_organization == "Hope Hospice and Community Services, Inc." & state_cd == "FL", 
+                           "Hope Healthcare",
+                   fifelse(parent_organization == "Hamaspik of Rockland County, Inc." & state_cd == "NY", 
+                           "Hamaspik",
+                   fifelse(parent_organization == "Harris County Hospital District" & state_cd == "TX", 
+                           "Harris Health System",
+                   fifelse(parent_organization == "Reid Hospital & Health Care Services, Inc." & state_cd == "IN", 
+                           "Reid Health", 
+                   fifelse(parent_organization == "Group Health Cooperative of Eau Claire" & state_cd == "WI", 
+                           "Group Health Cooperative Of WI", 
+                   fifelse(parent_organization == "CareFirst, Inc." & state_cd == "MD", 
+                           "CareFirst Community Partners, Inc.", 
+                           hardcode_parent_org))))))))))))))))] 
+
+# make list of parent orgs unique
+medicare_orgs <- unique(medicare_orgs)
+```
+
+
+# Identify TAF parent orgs
+  
+The mco_crosswalk variable `chse_parent_firm` represents the Medicaid parent organization. Methodologic detail is available on [GitHub](https://github.com/chse-ohsu/taf.functions/tree/main/Managed_Care_Crosswalks).  
+
+```{r}
+ma_crosswalk <- fread("mco_crosswalk_clean_20260306.csv",
+                      na.strings = c("","NA","NaN"),
+                      select = c("year", "state_cd", "cms_program_name", "taf_mc_plan_type_cd", "chse_parent_firm", 
+                                 "cms_parent_organization", "cms_plan_name", "taf_mc_plan_name", "taf_mc_plan_id"))
+```
+
+
+# Match MA/TAF parent orgs
+
+This chunk of code further cleans MA and TAF parent org names and flags those that are a match. You can then merge the match flag to your dataset by state, year, orig_medicare_parent_org, and medicaid_parent_org to identify individuals with MA and TAF plans that are owned by the same parent organization. 
+
+```{r}
+# function to further clean parent or names for matching
+clean_org_name <- function(name) {
+  name %>%
+    str_replace_all("([a-z])([A-Z])", "\\1 \\2") %>%  # Add space before uppercase letter in the middle of the word
+    tolower() %>% # Lowercase string
+    str_replace_all("[,\\.]", "") %>%  # Remove commas
+    str_replace_all("[&']", "") %>%  # Remove ampersands and apostrophes
+    str_replace_all("@", "") %>%  # Remove @ symbol
+    str_replace_all("\\(.*?\\)", "") %>%  # Remove anything inside parentheses
+    str_replace_all("\\b(inc|corporation|llc|lp|corp|co|company|group|holding|holdings|services|system|health|healthcare|medical|the|systems|connection|county|human|at|new york|rest|realty|state|solutions|older|citizens|national|altoona|greensburg|lehigh valley|york|washington|lifeways|association)\\b", "") %>%  # Remove specified words
+    trimws() %>% #Trim leading and trailing spaces
+    str_replace_all("\\s", "") #delete all spaces between words
+}
+
+# clean and organize unique parent orgs
+medicare_orgs <- medicare_orgs %>%
+  select(parent_organization, state_cd, hardcode_parent_org, year) %>%
+  distinct() %>%
+  arrange(state_cd, parent_organization) %>%
+  mutate(clean_name = clean_org_name(hardcode_parent_org))
+
+medicaid_orgs <- ma_crosswalk %>%
+  select(state_cd, chse_parent_firm, year) %>%
+  distinct() %>%
+  arrange(state_cd, chse_parent_firm) %>%
+  mutate(clean_name = clean_org_name(chse_parent_firm))
+
+# inner join medicare and medicaid orgs to get matches
+matches <- merge(medicare_orgs[, .(clean_name, state_cd, year, orig_medicare_parent_org = parent_organization)], 
+                      medicaid_orgs[, .(clean_name, state_cd, year, medicaid_parent_org = chse_parent_firm)], 
+                      by = c("clean_name", "state_cd", "year"), 
+                      all = FALSE)
+
+# add match flag equal 1 to all rows
+matches[, same_insurer_flag := 1]
+
+# same_insurer_flag can now be merged to the user's mbsf table by state, year, medicare_parent_org, and medicaid_parent_org
+```
+
+
+# Create same-insurer indicators
+
+In this section of code, we use the terms same-insurer synonymously with aligned/alignment.  
+
+A beneficiary's Medicare and Medicaid plans are aligned if they are both owned by the same parent organization. Each beneficiary has one MA plan but may have more than one Medicaid plan. The following code creates three alignment flags:  
+
+  1) *aligned_mco* = MCO plan (Comprehensive MCO) is aligned with MA plan *or* MCO plan includes MLTSS (Comprehensive MCO + MLTSS) and is aligned with MA plan  
+  
+  2) *aligned_bh* = Standalone BHO plan (Behavioral Health Organization) is aligned with MA plan *or* MCO is aligned with MA plan and person has no separate BHO*  
+  
+  3) *aligned_ltss* = Standalone MLTSS (MLTSS only) is aligned with MA plan *or* MCO plan includes MLTSS (Comprehensive MCO + MLTSS) and is aligned with MA plan and person has no separate MLTSS   
+
+* In this case we assume MCO includes BH services 
+
+At this stage of data management, prior to creating same-insurer indicators, we have a dataset called "mbsf" with one row per beneficiary-month-Medicaid plan. An individual with one Medicaid plan will have one row per month observed, an individual with two Medicaid plans (e.g. an MCO plan and a stand alone MLTSS plan) will have two rows for each month observed, one row where the Medicaid plan is the MCO and a second row where the Medicaid plan is the MLTSS plan. We have merged the "match" flag to the dataset, so rows where the Medicare and Medicaid parent are the same have match value of 1.
+
+```{r}
+# create mco alignment flag at the row level
+mbsf[, aligned_mco_row := as.numeric(same_insurer_flag == 1 &
+                                     mco_plan_type %in% c("cMCO", "cMCO+MLTSS"))]
+
+# roll alignment flag to the month level
+mbsf[, aligned_mco := max(aligned_mco_row), by = bene_mo]
+```
+ 
+```{r}
+# create bh alignment flags at the row level, one for aligned bho and one for any standalone bho
+mbsf[, sep_aligned_bh := fcase(mco_plan_type == "BHO" & same_insurer_flag == 1, 1, default = 0)]
+mbsf[, sep_bh := fcase(mco_plan_type == "BHO", 1, default = 0)]
+
+# roll alignment flags to the month level
+mbsf[, has_bho_standalone := max(sep_bh), by = bene_mo]
+mbsf[, has_bho_standalone_aligned:= max(sep_aligned_bh), by = bene_mo]
+mbsf[, has_bho_standalone_unaligned:= as.numeric(has_bho_standalone == 1 & has_bho_standalone_aligned == 0)]
+
+# create final aligned BH flag
+mbsf[, aligned_bh := as.numeric(has_bho_standalone_aligned == 1 | (aligned_mco == 1 & has_bho_standalone == 0))]
+```
+
+```{r}
+# create standalone mltss alignment flags at the row level, one for aligned mltss and one for any standalone mltss
+mbsf[, sep_aligned_mltss := fcase(mco_plan_type == "MLTSS" & same_insurer_flag == 1, 1, default = 0)] 
+mbsf[, sep_mltss := fcase(mco_plan_type == "MLTSS", 1, default = 0)]
+
+# roll standalone alignment flags to the month level
+mbsf[, has_ltssstandalone := max(sep_mltss), by = bene_mo]
+mbsf[, has_ltssstandalone_aligned:= max(sep_aligned_mltss), by = bene_mo]
+mbsf[, has_ltssstandalone_unaligned:= as.numeric(has_ltssstandalone == 1 & has_ltssstandalone_aligned == 0)]
+
+# create MCO+MLTSS alignment flags at the row level and then roll to month level
+mbsf[, aligned_mco_ltss_row := as.numeric(mco_plan_type %in% "cMCO+MLTSS" & same_insurer_flag == 1)] %>%
+  .[ , aligned_mco_ltss := max(aligned_mco_ltss_row), by = bene_mo]
+
+# create final flag for aligned MLTSS
+mbsf[, aligned_ltss := as.numeric(has_ltssstandalone_aligned == 1 | 
+                                  (aligned_mco_ltss == 1 & has_ltssstandalone == 0))]
+
+# create final alignment category at the bene-month level
+mbsf[, align_cat := fcase(
+  aligned_mco == 0 & aligned_bh == 0 & aligned_ltss == 0, "Not aligned",
+  aligned_mco == 1 & aligned_bh == 1 & aligned_ltss == 1, "Aligned with MCO + MLTSS + BHO",
+  aligned_mco == 1 & aligned_bh == 0 & aligned_ltss == 1, "Aligned with MCO + MLTSS",
+  aligned_mco == 0 & aligned_bh == 1 & aligned_ltss == 0, "Aligned with BHO",
+  aligned_mco == 0 & aligned_bh == 0 & aligned_ltss == 1, "Aligned with MLTSS",
+  aligned_mco == 1 & aligned_bh == 1 & aligned_ltss == 0, "Aligned with MCO + BHO",
+  aligned_mco == 1 & aligned_bh == 0 & aligned_ltss == 0, "Aligned with MCO",
+  aligned_mco == 0 & aligned_bh == 1 & aligned_ltss == 1, "Aligned with MLTSS + BHO",
+  default = NA_character_
+)]
+
+# data can now be aggregated to the beneficiary month level
+# keep only nec. vars that are the same across bene_mos
+keep_cols <- c("bene_id", "year", "calendar_mo", "study_mo", "state_res",
+               "age", "age_cat", "sex", "rti_race_cd", "bene_dob", "death_dt",
+               "orec", 
+               "ptc_cntrct_id_cd", "ptc_pbp_id_cd", "contract_name", "plan_name", 
+               "plan_type", "medicare_parent_organization",
+               "snp_type", "fide_snp",
+               "bene_mo", "person_mo_id", "state_fips_cd", "cnty_fips_cd",
+               "aligned_mco", "aligned_bh", "aligned_ltss", 
+               "has_bho_standalone_aligned", "has_bho_standalone_unaligned",  
+               "has_ltssstandalone_aligned", "has_ltssstandalone_unaligned",
+               "aligned_mco_ltss", "align_cat")
+
+# keep nec. cols
+mbsf <- mbsf[, ..keep_cols]
+
+# roll up to bene_mo
+mbsf <- unique(mbsf)
+```
+
+
+# Identify MA plan type
+
+We use two sources to identify the ma_plan_type as "standard_ma", "fide", "hide", or "co" (coordination only):  
+  - [Medicare Plan Characteristics File](https://resdac.org/cms-data/files/plan-characteristics)
+  - [SMAC D-SNP Integration Status reports](https://www.cms.gov/medicare/medicaid-coordination/about/dsnps)   
+
+The MA plan characteristics file includes the following variables:  
+  * snp_type  
+    - 0 (not an SNP)  
+    - C (chronic/disabling condition)  
+    - D (dual elig)  
+    - I (institutional)  
+  * fide_snp  
+    - Y (yes)  
+    - N (no)  
+    - 9 (not applicable)    
+
+The Integration Status report includes:  
+  * integration_status
+    - HIDE
+    - FIDE
+    - Coordination-Only  
+
+```{r}
+# create contract_plan_id in mbsf
+mbsf[, contract_plan_id := paste0(ptc_cntrct_id_cd, ptc_pbp_id_cd)]
+
+# merge snp_type and fide_snp from plan characteristics file to the mbsf table
+# create standard MA vs SNP 
+mbsf[, standard_ma:= fcase(snp_type %in% c('C', 'D', 'I'), 'snp', default = 'standard_ma')]
+
+# create fide: yes/no
+mbsf[, fide := fcase(fide_snp == "Y", 1, default = 0)]
+
+# load CMS AIP report
+aip <- data.table(read_excel("SMACDSNPIntegrationStatusesDataCY2021.xlsx",
+                  sheet = "CY2021 Data",
+                  skip = 1) %>% janitor::clean_names()) 
+
+# Note: R1548 offers one PBP in VA and NC. Because it is an RPPO, the integration status at the contract level is marked as the lowest level of integration, coordination-only; however, the VA SMAC on its own does meet HIDE status. We will update this below
+
+# check R1548
+aip[grepl("R1548", contract_number), .(contract_number, plan_id, state, integration_status)]
+
+# remove * from contract_number
+aip[, contract_number := gsub("\\*", "", contract_number)]
+
+# concatenate contract_id and plan_id
+aip[, contract_plan_id := paste0(contract_number, plan_id)]
+
+# temporarily change VA integration status to match R1548001 in NC
+aip[state=="VA" & contract_plan_id == "R1548001", integration_status:=  "Coordination-Only"]
+
+# merge
+mbsf <- merge(mbsf,
+              unique(aip[, .(contract_plan_id, integration_status,
+                             aip = applicable_integrated_plan)]),
+              by = c("contract_plan_id"),
+              all.x = T)
+
+# change VA integration status back to HIDE
+mbsf[state_res=="VA" & contract_plan_id == "R1548001", integration_status:=  "HIDE"]
+
+# create final ma_plan_type
+mbsf[, ma_plan_type:= fcase(standard_ma=="standard_ma", "standard_ma",
+                            integration_status == "FIDE", "fide",
+                            integration_status == "HIDE", "hide",
+                            integration_status == "Coordination-Only", "co",
+                            default = NA_character_)]
+```
+
+
+
